@@ -2,11 +2,15 @@ import os
 import re
 import shutil
 import ssl
+import json
 from github import Github
 from nltk.tokenize import word_tokenize
 from openai import OpenAI
 import pinecone
-from typing import List
+import faiss
+import numpy as np
+from typing import List, Dict
+
 
 # Attempt to download NLTK data with SSL verification disabled
 try:
@@ -166,8 +170,15 @@ def insert_vectors(index_name, vectors, metadata):
     index = pinecone.Index(index_name)
     to_upsert = []
     for i, (id, vector) in enumerate(zip(metadata['ids'], vectors)):
-        to_upsert.append((id, vector, {'text': metadata['text'][i]}))
-    index.upsert(vectors=to_upsert)
+        if len(vector) == 1536:  # Only insert vectors with the correct dimension
+            to_upsert.append((id, vector, {'text': metadata['text'][i]}))
+        else:
+            print(f"Skipping vector {id} due to incorrect dimension: {len(vector)}")
+
+    if to_upsert:
+        index.upsert(vectors=to_upsert)
+    else:
+        print("No vectors to insert due to dimension mismatch")
 
 
 def query_vector_db(index_name, query_vector, top_k=5):
@@ -200,13 +211,72 @@ def query_vector_db(index_name, query_vector, top_k=5):
     return processed_results
 
 
-def generate_prompt(query, context):
-    prompt = f"""
-    Context information:
-    {context}
+def extract_vectors_from_pinecone(index_name: str) -> Dict[str, Dict]:
+    """Extract all vectors and metadata from Pinecone index."""
+    index = pinecone.Index(index_name)
+    vector_data = {}
+    # Fetch in batches of 1000 (Pinecone's limit)
+    batch_size = 1000
+    total_vector_count = index.describe_index_stats()['total_vector_count']
 
-    Human: {query}
+    # Fetch all vector IDs first
+    all_ids = [f"chunk_{i}" for i in range(total_vector_count)]
 
-    Assistant: Based on the context provided, I'll do my best to answer your question.
-    """
-    return prompt
+    for i in range(0, total_vector_count, batch_size):
+        batch_ids = all_ids[i:i + batch_size]
+        results = index.fetch(ids=batch_ids)
+        for id, data in results['vectors'].items():
+            vector_data[id] = {
+                'vector': data['values'],
+                'metadata': data.get('metadata', {})
+            }
+
+    return vector_data
+
+
+def create_faiss_index(vectors: List[List[float]], output_dir: str) -> None:
+    """Create a FAISS index from the given vectors and save it to disk."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Convert vectors to numpy array
+    vectors_np = np.array(vectors).astype('float32')
+
+    # Create and train the index
+    dimension = vectors_np.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(vectors_np)
+
+    # Save the index to disk
+    faiss.write_index(index, os.path.join(output_dir, "faiss_index"))
+
+
+def save_metadata(metadata: Dict[str, Dict], output_dir: str) -> None:
+    """Save metadata to disk."""
+    import json
+    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f)
+
+
+def query_faiss_index(query_vector: List[float], index_path: str, metadata_path: str, top_k: int = 5) -> List[Dict]:
+    """Query the FAISS index and return results with metadata."""
+    # Load the FAISS index
+    index = faiss.read_index(index_path)
+
+    # Load metadata
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+
+    # Perform the query
+    query_vector_np = np.array([query_vector]).astype('float32')
+    distances, indices = index.search(query_vector_np, top_k)
+
+    # Prepare results
+    results = []
+    for i, idx in enumerate(indices[0]):
+        results.append({
+            'id': str(idx),
+            'score': float(distances[0][i]),
+            'metadata': metadata.get(str(idx), {})
+        })
+
+    return results

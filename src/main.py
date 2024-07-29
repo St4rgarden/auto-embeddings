@@ -4,7 +4,8 @@ from utils import (
     extract_github_data,
     preprocess_text, chunk_text, generate_embeddings_in_batches,
     setup_pinecone, get_or_create_index, clear_index, insert_vectors,
-    query_vector_db, generate_prompt, count_tokens
+    extract_vectors_from_pinecone, create_faiss_index, save_metadata,
+    query_faiss_index, count_tokens
 )
 
 # Load environment variables
@@ -58,22 +59,38 @@ def main():
         print("Clearing existing vectors from the index...")
         clear_index(valid_index_name)
 
-        # Insert vectors
-        print("Inserting vectors into the database...")
+        print("Inserting new vectors into the database...")
         metadata = {
             'ids': [f'chunk_{i}' for i in range(len(chunks))],
             'text': chunks
         }
         insert_vectors(valid_index_name, embeddings, metadata)
 
-        # Example query
-        print("Performing an example query...")
+        # Extract vectors from Pinecone
+        print("Extracting vectors from Pinecone...")
+        vector_data = extract_vectors_from_pinecone(valid_index_name)
+
+        # Create FAISS index
+        print("Creating FAISS index...")
+        output_dir = "./vector_store"
+        vectors = [data['vector'] for data in vector_data.values()]
+        create_faiss_index(vectors, output_dir)
+
+        # Save metadata
+        print("Saving metadata...")
+        metadata = {id: data['metadata'] for id, data in vector_data.items()}
+        save_metadata(metadata, output_dir)
+
+        # Example query using FAISS
+        print("Performing an example query using FAISS...")
         query = "What are the main features of the project?"
         query_embedding = generate_embeddings_in_batches([query], openai_api_key)[0]
-        results = query_vector_db(valid_index_name, query_embedding)
+        results = query_faiss_index(query_embedding,
+                                    os.path.join(output_dir, "faiss_index"),
+                                    os.path.join(output_dir, "metadata.json"))
 
-        # Generate prompt for Claude
-        print("Generating prompt for Claude...")
+        # Display results
+        print("Query results:")
         if results:
             print(f"Number of results: {len(results)}")
             for i, result in enumerate(results):
@@ -82,19 +99,6 @@ def main():
                 print(f"  Score: {result.get('score', 'No score')}")
                 print(f"  Metadata: {result.get('metadata', 'No metadata')}")
                 print(f"  Text: {result.get('metadata', {}).get('text', 'No text')}\n")
-
-            context = "\n".join(
-                [result.get('metadata', {}).get('text', f"No text found for chunk {result['id']}") for result in
-                 results])
-            print("Context used for prompt generation:")
-            print(context)
-
-            if context.strip():
-                final_prompt = generate_prompt(query, context)
-                print("Final prompt:")
-                print(final_prompt)
-            else:
-                print("No text content found in the results.")
         else:
             print("No results found for the query.")
 
